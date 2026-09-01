@@ -1,6 +1,3 @@
-# Exclude the old original-namespace Java file (left from fork history)
-android/src/main/java/xyz/
-
 # Root screenshots / dev images
 video_file.png
 video_url.png

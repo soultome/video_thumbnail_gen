@@ -4,7 +4,8 @@
   <a href="https://pub.dev/packages/video_thumbnail_gen"><img src="https://img.shields.io/pub/v/video_thumbnail_gen.svg?logo=dart&style=flat-square" alt="pub package"></a>
   <img src="https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-android%20%7C%20ios-lightgrey?style=flat-square" alt="platform">
-  <img src="https://img.shields.io/badge/dart-%3E%3D3.0.0-00B4AB?style=flat-square" alt="dart">
+  <img src="https://img.shields.io/badge/dart-%3E%3D3.12.0-00B4AB?style=flat-square" alt="dart">
+  <img src="https://img.shields.io/badge/flutter-%3E%3D3.44.0-02569B?style=flat-square" alt="flutter">
 </p>
 
 <p align="center">
@@ -43,8 +44,9 @@
 
 | Feature | Android | iOS |
 |---------|:-------:|:---:|
-| JPEG / PNG / WebP thumbnails | ✅ | ✅ |
-| HEIC thumbnails | ✅ API 30+ | ✅ iOS 11+ |
+| JPEG / PNG thumbnails | ✅ | ✅ |
+| WebP thumbnails | ✅ | ✅ |
+| HEIC thumbnails | ✅ API 30+ | ✅ iOS 13+ |
 | Batch frame extraction (single codec open) | ✅ | ✅ |
 | Video metadata (duration, size, rotation) | ✅ | ✅ |
 | In-memory LRU / NSCache | ✅ | ✅ |
@@ -53,6 +55,21 @@
 | Custom output filename | ✅ | ✅ |
 | Swift Package Manager (SPM) | — | ✅ |
 | Typed error codes | ✅ | ✅ |
+| Native language | Kotlin | Swift |
+
+---
+
+## ✅ Requirements
+
+| | Minimum |
+|---|---|
+| Flutter SDK | **3.44.0** |
+| Dart SDK | **3.12.0** |
+| iOS deployment target | **13.0** |
+| Android Gradle Plugin | **9.0.0** (built-in Kotlin) |
+| Gradle | **9.0** |
+| Java / JVM target | **17** |
+| Swift | **5.9** |
 
 ---
 
@@ -68,7 +85,7 @@ This will add a line like this to your package's `pubspec.yaml` (and run an impl
 
 ```yaml
 dependencies:
-  video_thumbnail_gen: ^0.6.3
+  video_thumbnail_gen: ^0.7.0
 ```
 
 ---
@@ -249,7 +266,7 @@ try {
 | `ImageFormat.JPEG` | ✅ All APIs | ✅ All | ✅ |
 | `ImageFormat.PNG` | ✅ All APIs | ✅ All | ❌ (lossless) |
 | `ImageFormat.WEBP` | ✅ All APIs | ✅ (libwebp) | ✅ |
-| `ImageFormat.HEIC` | ✅ API 30+ | ✅ iOS 11+ | ✅ |
+| `ImageFormat.HEIC` | ✅ API 30+ | ✅ iOS 13+ | ✅ |
 
 > **Note:** HEIC falls back to JPEG on older OS versions.
 
@@ -257,15 +274,26 @@ try {
 
 ## 🍎 iOS: Swift Package Manager (SPM)
 
-A `Package.swift` manifest is included for SPM integration in Xcode 14+.
-WebP is only available via CocoaPods; SPM builds fall back to JPEG gracefully.
+This plugin ships both a Swift package (`ios/video_thumbnail_gen/Package.swift`) and a
+CocoaPods podspec (`ios/video_thumbnail_gen.podspec`), so it works with either dependency
+manager — no action is needed on your side.
+
+The iOS implementation is written in Swift. Every format behaves identically under both
+integrations: Apple provides no WebP encoder, so WebP goes through `libwebp` — supplied by the
+`libwebp` pod under CocoaPods, and by the
+[SDWebImage/libwebp-Xcode](https://github.com/SDWebImage/libwebp-Xcode) package under Swift
+Package Manager. Both build the same upstream libwebp 1.6 sources.
+
+**Swift Package Manager** (opt in per machine):
+```bash
+flutter config --enable-swift-package-manager
+```
+Flutter then adds the plugin to your Xcode project under **Package Dependencies**.
 
 **CocoaPods** (default):
-```ruby
-pod 'video_thumbnail_gen', :path => '../'
+```bash
+flutter config --no-enable-swift-package-manager
 ```
-
-**SPM**: Add the package URL directly in Xcode → File → Add Package Dependencies.
 
 ---
 
