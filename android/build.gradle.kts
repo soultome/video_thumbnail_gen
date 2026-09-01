@@ -49,6 +49,12 @@ android {
     }
 }
 
+dependencies {
+    // Reads EXIF from images (capture time, camera make/model, GPS, orientation),
+    // including HEIF. The framework's android.media.ExifInterface is far weaker.
+    implementation("androidx.exifinterface:exifinterface:1.4.1")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
