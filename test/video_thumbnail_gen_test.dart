@@ -31,6 +31,64 @@ void main() {
           final List<int> times = List<int>.from(a['timesMs'] as List);
           return times.map((_) => Uint8List.fromList([0xFF])).toList();
         case 'metadata':
+          final v = a['video'] as String;
+          if (v == 'image') {
+            // A still image: no duration, no camera tags, no location.
+            return <String, dynamic>{
+              'durationMs': null,
+              'width': 4032,
+              'height': 3024,
+              'rotation': 0,
+              'mimeType': 'image/heic',
+              'capturedAt': null,
+              'modifiedAt': null,
+              'cameraMake': null,
+              'cameraModel': null,
+              'gps': null,
+            };
+          }
+          if (v == 'rich') {
+            // Everything present, including altitude.
+            return <String, dynamic>{
+              'durationMs': 5000,
+              'width': 1920,
+              'height': 1080,
+              'rotation': 90,
+              'mimeType': 'video/quicktime',
+              'capturedAt': 1700000000000,
+              'modifiedAt': 1700000600000,
+              'cameraMake': 'Apple',
+              'cameraModel': 'iPhone 15 Pro',
+              'gps': <String, dynamic>{
+                'lat': 37.7749,
+                'lon': -122.4194,
+                'alt': 12.5,
+              },
+            };
+          }
+          if (v == 'partial') {
+            // A location without altitude, and only some of the other tags.
+            return <String, dynamic>{
+              'durationMs': 5000,
+              'width': 1920,
+              'height': 1080,
+              'rotation': 0,
+              'mimeType': 'video/mp4',
+              'cameraMake': 'Apple',
+              'gps': <String, dynamic>{'lat': 1.5, 'lon': -2.5},
+            };
+          }
+          if (v == 'badgps') {
+            // Malformed location: must degrade to null, not throw.
+            return <String, dynamic>{
+              'durationMs': 5000,
+              'width': 1920,
+              'height': 1080,
+              'rotation': 0,
+              'mimeType': 'video/mp4',
+              'gps': <String, dynamic>{'lon': -2.5},
+            };
+          }
           return <String, dynamic>{
             'durationMs': 5000,
             'width': 1920,
@@ -143,6 +201,91 @@ void main() {
       final meta = await VideoThumbnail.getVideoMetadata(video: 'video');
       expect(meta.toString(), contains('5000ms'));
       expect(meta.toString(), contains('1920'));
+    });
+
+    test('legacy payload leaves every new field null', () async {
+      // A native side that only sends the original keys must still decode.
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'video');
+      expect(meta!.capturedAt, isNull);
+      expect(meta.modifiedAt, isNull);
+      expect(meta.cameraMake, isNull);
+      expect(meta.cameraModel, isNull);
+      expect(meta.gps, isNull);
+      // durationMs was present, so duration is populated.
+      expect(meta.duration, const Duration(milliseconds: 5000));
+    });
+
+    test('decodes the full set of new fields', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'rich');
+      expect(meta, isNotNull);
+      expect(meta!.mimeType, 'video/quicktime');
+      expect(meta.duration, const Duration(seconds: 5));
+      expect(meta.durationMs, 5000);
+      expect(meta.cameraMake, 'Apple');
+      expect(meta.cameraModel, 'iPhone 15 Pro');
+      expect(meta.rotation, 90);
+      expect(meta.gps, isNotNull);
+      expect(meta.gps!.lat, closeTo(37.7749, 1e-9));
+      expect(meta.gps!.lon, closeTo(-122.4194, 1e-9));
+      expect(meta.gps!.alt, closeTo(12.5, 1e-9));
+    });
+
+    test('timestamps decode from epoch millis and round-trip as UTC', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'rich');
+      expect(meta!.capturedAt!.toUtc(),
+          DateTime.fromMillisecondsSinceEpoch(1700000000000, isUtc: true));
+      expect(meta.modifiedAt!.toUtc(),
+          DateTime.fromMillisecondsSinceEpoch(1700000600000, isUtc: true));
+      // capturedAt is the capture time, not the file's modification time.
+      expect(meta.capturedAt!.isBefore(meta.modifiedAt!), isTrue);
+    });
+
+    test('images report no duration but keep durationMs at zero', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'image');
+      expect(meta, isNotNull);
+      expect(meta!.duration, isNull);
+      expect(meta.durationMs, 0);
+      expect(meta.mimeType, 'image/heic');
+      expect(meta.width, 4032);
+      expect(meta.height, 3024);
+      expect(meta.gps, isNull);
+      expect(meta.cameraMake, isNull);
+    });
+
+    test('fields resolve independently when only some are present', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'partial');
+      expect(meta!.cameraMake, 'Apple');
+      expect(meta.cameraModel, isNull);
+      expect(meta.capturedAt, isNull);
+      // Location present, altitude absent — alt is null on its own.
+      expect(meta.gps, isNotNull);
+      expect(meta.gps!.lat, 1.5);
+      expect(meta.gps!.lon, -2.5);
+      expect(meta.gps!.alt, isNull);
+    });
+
+    test('gps is null as a group rather than defaulting to 0,0', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'badgps');
+      // Latitude missing, so the whole group is dropped instead of becoming 0.
+      expect(meta!.gps, isNull);
+    });
+
+    test('GpsCoordinates.fromMap rejects incomplete input', () {
+      expect(GpsCoordinates.fromMap(null), isNull);
+      expect(GpsCoordinates.fromMap('nonsense'), isNull);
+      expect(GpsCoordinates.fromMap(<String, dynamic>{'lat': 1.0}), isNull);
+      expect(GpsCoordinates.fromMap(<String, dynamic>{'lon': 1.0}), isNull);
+      final gps = GpsCoordinates.fromMap(<String, dynamic>{'lat': 1, 'lon': 2});
+      expect(gps, isNotNull);
+      expect(gps!.lat, 1.0);
+      expect(gps.alt, isNull);
+    });
+
+    test('toString surfaces the new fields when present', () async {
+      final meta = await VideoThumbnail.getVideoMetadata(video: 'rich');
+      final text = meta.toString();
+      expect(text, contains('camera:Apple iPhone 15 Pro'));
+      expect(text, contains('gps:37.7749,-122.4194'));
     });
   });
 

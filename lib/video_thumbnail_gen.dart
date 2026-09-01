@@ -82,24 +82,90 @@ class ThumbnailException implements Exception {
   }
 }
 
-// ─── Video metadata ───────────────────────────────────────────────────────────
+// ─── Media metadata ───────────────────────────────────────────────────────────
 
-/// Metadata extracted from a video without generating a thumbnail.
+/// A geographic location recorded in the source file.
+///
+/// The whole object is `null` when the file carries no location data — the
+/// fields are never defaulted to `0, 0`. [alt] is independently `null` when the
+/// file records a position but no altitude.
+class GpsCoordinates {
+  /// Latitude in degrees, positive north.
+  final double lat;
+
+  /// Longitude in degrees, positive east.
+  final double lon;
+
+  /// Altitude in metres above sea level, or `null` if not recorded.
+  final double? alt;
+
+  const GpsCoordinates({required this.lat, required this.lon, this.alt});
+
+  /// Parses the `gps` sub-map sent by the native side. Returns `null` unless
+  /// both latitude and longitude are present.
+  static GpsCoordinates? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    final lat = (raw['lat'] as num?)?.toDouble();
+    final lon = (raw['lon'] as num?)?.toDouble();
+    if (lat == null || lon == null) return null;
+    return GpsCoordinates(
+      lat: lat,
+      lon: lon,
+      alt: (raw['alt'] as num?)?.toDouble(),
+    );
+  }
+
+  @override
+  String toString() =>
+      'GpsCoordinates($lat, $lon${alt == null ? '' : ', ${alt}m'})';
+}
+
+/// Metadata extracted from a video **or image** without generating a thumbnail.
+///
+/// Every field other than [width], [height] and [rotation] can be `null`: what
+/// is available depends entirely on what the source file records and on the
+/// platform. Never assume a field is populated.
 class VideoMetadata {
-  /// Total video duration in milliseconds.
+  /// Total video duration in milliseconds, or `0` when the source has no
+  /// duration (an image, or a video whose duration could not be read).
+  ///
+  /// Prefer [duration], which distinguishes "no duration" from "zero".
   final int durationMs;
 
-  /// Video frame width **after** applying rotation (i.e. display width).
+  /// Frame width **after** applying rotation (i.e. display width).
   final int width;
 
-  /// Video frame height **after** applying rotation (i.e. display height).
+  /// Frame height **after** applying rotation (i.e. display height).
   final int height;
 
   /// Clockwise rotation in degrees (0, 90, 180 or 270).
   final int rotation;
 
-  /// MIME type reported by the container (e.g. `"video/mp4"`). May be `null`.
+  /// MIME type of the source, e.g. `"video/mp4"` or `"image/heic"`.
   final String? mimeType;
+
+  /// Duration of the media, or `null` for images and when unknown.
+  final Duration? duration;
+
+  /// When the photo or video was actually captured, as recorded by the camera.
+  ///
+  /// This is **not** the file's modification time — see [modifiedAt]. EXIF
+  /// records capture time without a UTC offset, so when the source provides no
+  /// explicit offset the timestamp is interpreted in the device's current time
+  /// zone. `null` when the source records no capture time.
+  final DateTime? capturedAt;
+
+  /// Last modification time of the underlying file, or `null` if unavailable.
+  final DateTime? modifiedAt;
+
+  /// Camera manufacturer, e.g. `"Apple"`. `null` when not recorded.
+  final String? cameraMake;
+
+  /// Camera model, e.g. `"iPhone 15 Pro"`. `null` when not recorded.
+  final String? cameraModel;
+
+  /// Capture location, or `null` when the file carries no location data.
+  final GpsCoordinates? gps;
 
   const VideoMetadata({
     required this.durationMs,
@@ -107,11 +173,55 @@ class VideoMetadata {
     required this.height,
     required this.rotation,
     this.mimeType,
+    this.duration,
+    this.capturedAt,
+    this.modifiedAt,
+    this.cameraMake,
+    this.cameraModel,
+    this.gps,
   });
 
+  /// Builds a [VideoMetadata] from the map sent across the method channel.
+  ///
+  /// Each field is decoded independently, so one missing or malformed entry
+  /// leaves that field `null` rather than failing the whole call.
+  factory VideoMetadata.fromMap(Map<dynamic, dynamic> map) {
+    final rawDurationMs = (map['durationMs'] as num?)?.toInt();
+    return VideoMetadata(
+      durationMs: rawDurationMs ?? 0,
+      width: (map['width'] as num?)?.toInt() ?? 0,
+      height: (map['height'] as num?)?.toInt() ?? 0,
+      rotation: (map['rotation'] as num?)?.toInt() ?? 0,
+      mimeType: map['mimeType'] as String?,
+      duration:
+          rawDurationMs == null ? null : Duration(milliseconds: rawDurationMs),
+      capturedAt: _dateFromEpochMs(map['capturedAt']),
+      modifiedAt: _dateFromEpochMs(map['modifiedAt']),
+      cameraMake: map['cameraMake'] as String?,
+      cameraModel: map['cameraModel'] as String?,
+      gps: GpsCoordinates.fromMap(map['gps']),
+    );
+  }
+
+  /// Native sends epoch milliseconds in UTC; expose a local [DateTime].
+  static DateTime? _dateFromEpochMs(Object? raw) {
+    final ms = (raw as num?)?.toInt();
+    if (ms == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toLocal();
+  }
+
   @override
-  String toString() =>
-      'VideoMetadata(${durationMs}ms, ${width}×${height}, rot:$rotation°, $mimeType)';
+  String toString() {
+    final extras = <String>[
+      if (capturedAt != null) 'captured:$capturedAt',
+      if (modifiedAt != null) 'modified:$modifiedAt',
+      if (cameraMake != null || cameraModel != null)
+        'camera:${[cameraMake, cameraModel].whereType<String>().join(' ')}',
+      if (gps != null) 'gps:${gps!.lat},${gps!.lon}',
+    ];
+    return 'VideoMetadata(${durationMs}ms, ${width}×${height}, '
+        'rot:$rotation°, $mimeType${extras.isEmpty ? '' : ', ${extras.join(', ')}'})';
+  }
 }
 
 // ─── Main plugin class ────────────────────────────────────────────────────────
@@ -367,13 +477,7 @@ class VideoThumbnail {
         },
       );
       if (result == null) return null;
-      return VideoMetadata(
-        durationMs: (result['durationMs'] as num?)?.toInt() ?? 0,
-        width: (result['width'] as num?)?.toInt() ?? 0,
-        height: (result['height'] as num?)?.toInt() ?? 0,
-        rotation: (result['rotation'] as num?)?.toInt() ?? 0,
-        mimeType: result['mimeType'] as String?,
-      );
+      return VideoMetadata.fromMap(result);
     } on PlatformException catch (e) {
       throw ThumbnailException(
         code: ThumbnailException._codeFromString(e.code),

@@ -48,7 +48,7 @@
 | WebP thumbnails | ✅ | ✅ |
 | HEIC thumbnails | ✅ API 30+ | ✅ iOS 13+ |
 | Batch frame extraction (single codec open) | ✅ | ✅ |
-| Video metadata (duration, size, rotation) | ✅ | ✅ |
+| Media metadata (date, camera, GPS, size, duration) | ✅ | ✅ |
 | In-memory LRU / NSCache | ✅ | ✅ |
 | `content://` (SAF) URI support | ✅ | — |
 | HTTP(S) remote video URL | ✅ | ✅ |
@@ -132,17 +132,31 @@ final List<Uint8List?> frames = await VideoThumbnail.thumbnailDataList(
 );
 ```
 
-### Get video metadata
+### Get video (or image) metadata
+
+Works for videos **and** still images, for file paths and — on Android — `content://` URIs.
 
 ```dart
 final VideoMetadata? meta = await VideoThumbnail.getVideoMetadata(
   video: '/path/to/video.mp4',
 );
-print('Duration: ${meta?.durationMs}ms');
-print('Size: ${meta?.width}×${meta?.height}');
+print('Size: ${meta?.width}×${meta?.height}');   // display dimensions
 print('Rotation: ${meta?.rotation}°');
-print('MIME: ${meta?.mimeType}');
+print('MIME: ${meta?.mimeType}');                // "video/mp4", "image/heic", …
+print('Duration: ${meta?.duration}');            // null for images
+print('Captured: ${meta?.capturedAt}');          // when it was shot
+print('Modified: ${meta?.modifiedAt}');          // file mtime
+print('Camera: ${meta?.cameraMake} ${meta?.cameraModel}');
+
+// gps is null as a whole when the file has no location — never 0, 0.
+final gps = meta?.gps;
+if (gps != null) {
+  print('Location: ${gps.lat}, ${gps.lon} @ ${gps.alt ?? 'unknown'}m');
+}
 ```
+
+> **Every field can be `null`.** What comes back depends entirely on what the source
+> file records and on the platform — see the table below before relying on any of them.
 
 ### Clear the in-memory cache
 
@@ -206,15 +220,49 @@ static Future<VideoMetadata?> getVideoMetadata({
 })
 ```
 
-Returns a `VideoMetadata` object:
+Accepts a video **or** an image. Returns a `VideoMetadata` object:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `durationMs` | `int` | Total video duration in milliseconds |
 | `width` | `int` | Display width (after rotation) |
 | `height` | `int` | Display height (after rotation) |
 | `rotation` | `int` | Clockwise rotation: 0, 90, 180, 270 |
-| `mimeType` | `String?` | Container MIME type, e.g. `"video/mp4"` |
+| `mimeType` | `String?` | e.g. `"video/mp4"`, `"image/heic"` |
+| `duration` | `Duration?` | `null` for images and when unknown |
+| `durationMs` | `int` | Duration in milliseconds; `0` when there is none |
+| `capturedAt` | `DateTime?` | When the photo/video was taken |
+| `modifiedAt` | `DateTime?` | Last file modification time |
+| `cameraMake` | `String?` | e.g. `"Apple"` |
+| `cameraModel` | `String?` | e.g. `"iPhone 15 Pro"` |
+| `gps` | `GpsCoordinates?` | `null` as a group when there is no location |
+
+`GpsCoordinates` exposes `lat` and `lon` (both `double`) plus `alt` (`double?`, `null`
+when no altitude was recorded).
+
+#### Nullability
+
+**Any field above other than `width`, `height`, `rotation` and `durationMs` may be `null`**,
+independently of the others — a file with EXIF GPS but no camera model returns the location
+and a `null` `cameraModel`. Nothing throws because one tag is missing.
+
+`durationMs` is kept non-nullable for backwards compatibility and reports `0` when there is
+no duration; use `duration` to tell "no duration" apart from "zero".
+
+#### What each platform can supply
+
+| Field | Android | iOS |
+|-------|---------|-----|
+| `capturedAt` | images: EXIF · videos: container date | images: EXIF · videos: creation date |
+| `cameraMake` / `cameraModel` | images only (EXIF) | images (EXIF) and videos (asset metadata) |
+| `gps` | images: EXIF · videos: ISO-6709 tag | images: EXIF · videos: ISO-6709 tag |
+| `modifiedAt` | file paths and `content://` | file paths |
+
+`MediaMetadataRetriever` exposes no camera make/model keys, so those are always `null` for
+**videos on Android**. On iOS, metadata for images is read only from local files; remote URLs
+are handled through AVFoundation.
+
+`capturedAt` is best-effort: EXIF records local time with no UTC offset, so when the file
+carries no explicit offset the timestamp is interpreted in the device's current time zone.
 
 ### `VideoThumbnail.clearCache`
 

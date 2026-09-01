@@ -2,13 +2,18 @@ package com.itsxhadi.video_thumbnail
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.util.Log
 import android.util.LruCache
+import android.webkit.MimeTypeMap
+import androidx.exifinterface.media.ExifInterface
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -20,6 +25,10 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -132,13 +141,18 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             }
 
             runOnUiThread {
-                if (!handled) {
-                    result.notImplemented()
-                    return@runOnUiThread
-                }
+                // A failure inside a known method must surface as its typed error
+                // code. `handled` is only set once the work succeeds, so checking
+                // it first would report every failure as notImplemented — which
+                // reaches Dart as MissingPluginException instead of, say,
+                // FILE_NOT_FOUND.
                 if (exc != null) {
                     exc.printStackTrace()
                     result.error(errCode ?: ERR_UNKNOWN, exc.message, null)
+                    return@runOnUiThread
+                }
+                if (!handled) {
+                    result.notImplemented()
                     return@runOnUiThread
                 }
                 result.success(thumbnail)
@@ -274,27 +288,55 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
         return results
     }
 
-    // ─── Video metadata ───────────────────────────────────────────────────────
+    // ─── Media metadata ───────────────────────────────────────────────────────
 
-    @Throws(IOException::class)
+    /**
+     * Metadata for a video *or* an image.
+     *
+     * Every field is resolved independently and defensively: a tag the source
+     * file does not carry comes back as null rather than failing the call.
+     */
     private fun getVideoMetadata(
         vidPath: String,
         headers: HashMap<String, String>?,
     ): Map<String, Any?> {
+        val mimeType = runCatching { resolveMimeType(vidPath) }.getOrNull()
+        return if (mimeType != null && mimeType.startsWith("image/")) {
+            imageMetadata(vidPath, mimeType)
+        } else {
+            videoMetadata(vidPath, headers, mimeType)
+        }
+    }
+
+    private fun videoMetadata(
+        vidPath: String,
+        headers: HashMap<String, String>?,
+        fallbackMime: String?,
+    ): Map<String, Any?> {
         val retriever = MediaMetadataRetriever()
         try {
             openRetriever(vidPath, headers, retriever)
-            val dMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-            val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-            val rot = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
-            val mime = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
+
+            fun key(id: Int): String? =
+                runCatching { retriever.extractMetadata(id) }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+            val rotation = key(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val storedWidth = key(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val storedHeight = key(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+
             return mapOf(
-                "durationMs" to (dMs?.toLong() ?: 0L),
-                "width" to (w?.toInt() ?: 0),
-                "height" to (h?.toInt() ?: 0),
-                "rotation" to (rot?.toInt() ?: 0),
-                "mimeType" to mime,
+                "durationMs" to key(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull(),
+                "width" to storedWidth,
+                "height" to storedHeight,
+                "rotation" to rotation,
+                "mimeType" to (key(MediaMetadataRetriever.METADATA_KEY_MIMETYPE) ?: fallbackMime),
+                "capturedAt" to parseVideoDate(key(MediaMetadataRetriever.METADATA_KEY_DATE)),
+                "modifiedAt" to lastModifiedMs(vidPath),
+                // MediaMetadataRetriever exposes no camera make/model keys, so these
+                // stay null for videos on Android.
+                "cameraMake" to null,
+                "cameraModel" to null,
+                "gps" to parseIso6709(key(MediaMetadataRetriever.METADATA_KEY_LOCATION)),
             )
         } finally {
             try {
@@ -303,6 +345,173 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             }
         }
     }
+
+    private fun imageMetadata(vidPath: String, mimeType: String): Map<String, Any?> {
+        // Stored pixel dimensions. BitmapFactory does not apply EXIF orientation,
+        // so these are pre-rotation and get transposed below when needed.
+        var storedWidth = 0
+        var storedHeight = 0
+        runCatching {
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            openStream(vidPath)?.use { BitmapFactory.decodeStream(it, null, options) }
+            if (options.outWidth > 0) storedWidth = options.outWidth
+            if (options.outHeight > 0) storedHeight = options.outHeight
+        }
+
+        val exif = runCatching { openStream(vidPath)?.use { ExifInterface(it) } }.getOrNull()
+
+        val orientation = exif?.let {
+            runCatching {
+                it.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            }.getOrNull()
+        } ?: ExifInterface.ORIENTATION_NORMAL
+
+        val rotation = when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_180, ExifInterface.ORIENTATION_FLIP_VERTICAL -> 180
+            ExifInterface.ORIENTATION_ROTATE_90, ExifInterface.ORIENTATION_TRANSPOSE -> 90
+            ExifInterface.ORIENTATION_ROTATE_270, ExifInterface.ORIENTATION_TRANSVERSE -> 270
+            else -> 0
+        }
+        // Orientations 5–8 are quarter turns: the stored pixels are transposed
+        // relative to how the image displays.
+        val quarterTurn = orientation in 5..8
+        val width = if (quarterTurn) storedHeight else storedWidth
+        val height = if (quarterTurn) storedWidth else storedHeight
+
+        fun tag(name: String): String? = exif?.let {
+            runCatching { it.getAttribute(name) }.getOrNull()?.takeIf { v -> v.isNotEmpty() }
+        }
+
+        val captured = parseExifDate(
+            tag(ExifInterface.TAG_DATETIME_ORIGINAL)
+                ?: tag(ExifInterface.TAG_DATETIME_DIGITIZED)
+                ?: tag(ExifInterface.TAG_DATETIME),
+            tag(ExifInterface.TAG_OFFSET_TIME_ORIGINAL) ?: tag(ExifInterface.TAG_OFFSET_TIME),
+        )
+
+        return mapOf(
+            // Images have no duration; null is what distinguishes them from a
+            // zero-length video.
+            "durationMs" to null,
+            "width" to width,
+            "height" to height,
+            "rotation" to rotation,
+            "mimeType" to mimeType,
+            "capturedAt" to captured,
+            "modifiedAt" to lastModifiedMs(vidPath),
+            "cameraMake" to tag(ExifInterface.TAG_MAKE),
+            "cameraModel" to tag(ExifInterface.TAG_MODEL),
+            "gps" to exifGps(exif),
+        )
+    }
+
+    private fun exifGps(exif: ExifInterface?): Map<String, Any?>? {
+        if (exif == null) return null
+        // latLong() is null unless a usable fix is present, which is exactly the
+        // "null as a group" semantics we want — never default to 0, 0.
+        val latLong = runCatching { exif.latLong }.getOrNull() ?: return null
+        if (latLong.size < 2) return null
+
+        val payload = mutableMapOf<String, Any?>("lat" to latLong[0], "lon" to latLong[1])
+        val altitude = runCatching { exif.getAltitude(Double.NaN) }.getOrNull()
+        if (altitude != null && !altitude.isNaN()) payload["alt"] = altitude
+        return payload
+    }
+
+    // ─── Metadata helpers ─────────────────────────────────────────────────────
+
+    /** Opens a stream for a `content://`, `file://`, or plain filesystem path. */
+    private fun openStream(path: String): InputStream? = when {
+        path.startsWith("content://") ->
+            context?.contentResolver?.openInputStream(Uri.parse(path))
+        path.startsWith("file://") -> FileInputStream(path.substring(7))
+        path.startsWith("/") -> FileInputStream(path)
+        else -> null
+    }
+
+    private fun resolveMimeType(path: String): String? {
+        if (path.startsWith("content://")) {
+            context?.contentResolver?.getType(Uri.parse(path))?.let { return it }
+        }
+        val extension = MimeTypeMap.getFileExtensionFromUrl(path)
+            .ifEmpty { path.substringAfterLast('.', "") }
+            .lowercase()
+        if (extension.isEmpty()) return null
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+    }
+
+    private fun lastModifiedMs(path: String): Long? = runCatching {
+        when {
+            path.startsWith("content://") -> contentLastModifiedMs(Uri.parse(path))
+            path.startsWith("file://") -> File(path.substring(7)).lastModified().takeIf { it > 0 }
+            path.startsWith("/") -> File(path).lastModified().takeIf { it > 0 }
+            else -> null
+        }
+    }.getOrNull()
+
+    private fun contentLastModifiedMs(uri: Uri): Long? {
+        val resolver = context?.contentResolver ?: return null
+        val columns = arrayOf(
+            MediaStore.MediaColumns.DATE_MODIFIED,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+        for (column in columns) {
+            val value = runCatching {
+                resolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+                }
+            }.getOrNull() ?: continue
+            if (value <= 0) continue
+            // MediaStore reports seconds; DocumentsContract reports milliseconds.
+            return if (column == MediaStore.MediaColumns.DATE_MODIFIED) value * 1000 else value
+        }
+        return null
+    }
+
+    /** Parses an ISO-6709 location such as `+37.7749-122.4194+010.500/`. */
+    private fun parseIso6709(raw: String?): Map<String, Any?>? {
+        if (raw.isNullOrEmpty()) return null
+        val match = ISO_6709.find(raw) ?: return null
+        val lat = match.groupValues[1].toDoubleOrNull() ?: return null
+        val lon = match.groupValues[2].toDoubleOrNull() ?: return null
+        val payload = mutableMapOf<String, Any?>("lat" to lat, "lon" to lon)
+        match.groupValues[3].takeIf { it.isNotEmpty() }?.toDoubleOrNull()
+            ?.let { payload["alt"] = it }
+        return payload
+    }
+
+    /** `METADATA_KEY_DATE` is UTC, formatted `yyyyMMdd'T'HHmmss[.SSS]'Z'`. */
+    private fun parseVideoDate(raw: String?): Long? {
+        if (raw.isNullOrEmpty()) return null
+        for (pattern in arrayOf("yyyyMMdd'T'HHmmss.SSS'Z'", "yyyyMMdd'T'HHmmss'Z'")) {
+            val parsed = runCatching {
+                SimpleDateFormat(pattern, Locale.US)
+                    .apply { timeZone = TimeZone.getTimeZone("UTC") }
+                    .parse(raw)
+            }.getOrNull()
+            if (parsed != null) return parsed.time
+        }
+        return null
+    }
+
+    /**
+     * Parses an EXIF timestamp (`yyyy:MM:dd HH:mm:ss`). EXIF carries no time zone,
+     * so without an explicit offset the device's zone is assumed.
+     */
+    private fun parseExifDate(raw: String?, utcOffset: String?): Long? {
+        if (raw.isNullOrEmpty()) return null
+        if (!utcOffset.isNullOrEmpty()) {
+            runCatching {
+                SimpleDateFormat("yyyy:MM:dd HH:mm:ssXXX", Locale.US).parse(raw + utcOffset)
+            }.getOrNull()?.let { return it.time }
+        }
+        return runCatching {
+            SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                .apply { timeZone = TimeZone.getDefault() }
+                .parse(raw)
+        }.getOrNull()?.time
+    }
+
 
     // ─── Core frame extraction ────────────────────────────────────────────────
 
@@ -368,6 +577,10 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
 
     companion object {
         private const val TAG = "VideoThumbnailPlugin"
+
+        /** ISO-6709 latitude/longitude/optional-altitude, e.g. `+37.77-122.41+010.5/`. */
+        private val ISO_6709 =
+            Regex("""([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?""")
 
         // ─── MethodChannel identifier ─────────────────────────────────────────
         private const val CHANNEL = "plugins.itsxhadi.com/video_thumbnail_gen"

@@ -14,6 +14,7 @@ import Flutter
 import Foundation
 import ImageIO
 import UIKit
+import UniformTypeIdentifiers
 
 // Under Swift Package Manager the libwebp bridge is a separate target and must
 // be imported. Under CocoaPods everything lands in one module, so the type is
@@ -317,85 +318,319 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
 
     // MARK: - metadata
 
+    /// Everything the video path needs to read from AVFoundation. Both the modern
+    /// and the legacy loader fill this in, so the payload builder stays shared.
+    private struct VideoFacts {
+        var durationMs: Int64?
+        var width = 0
+        var height = 0
+        var rotation = 0
+        var creationDate: Date?
+        var make: String?
+        var model: String?
+        var isoLocation: String?
+    }
+
     private static func handleMetadata(
         url: URL,
         headers: [String: String]?,
         result: @escaping FlutterResult
     ) {
-        let asset = makeAsset(url: url, headers: headers)
+        // Match Android, which reports a missing file as FILE_NOT_FOUND rather
+        // than handing back a metadata map full of zeros.
+        if url.isFileURL, !FileManager.default.fileExists(atPath: url.path) {
+            reply(result, with: FlutterError(
+                code: ErrorCode.fileNotFound,
+                message: "No such file: \(url.path)",
+                details: nil
+            ))
+            return
+        }
 
         if #available(iOS 16.0, *) {
             Task.detached(priority: .userInitiated) {
-                let metadata = await loadMetadata(from: asset)
-                reply(result, with: metadata)
+                if let image = imageMetadata(at: url) {
+                    reply(result, with: image)
+                    return
+                }
+                let facts = await videoFacts(from: makeAsset(url: url, headers: headers))
+                reply(result, with: payload(from: facts, url: url))
             }
         } else {
             workQueue.async {
-                reply(result, with: loadMetadataLegacy(from: asset))
+                if let image = imageMetadata(at: url) {
+                    reply(result, with: image)
+                    return
+                }
+                let facts = videoFactsLegacy(from: makeAsset(url: url, headers: headers))
+                reply(result, with: payload(from: facts, url: url))
             }
         }
     }
 
-    @available(iOS 16.0, *)
-    private static func loadMetadata(from asset: AVURLAsset) async -> [String: Any] {
-        var durationMs: Int64 = 0
-        var width = 0
-        var height = 0
-        var rotation = 0
-        var mimeType: Any = NSNull()
+    // MARK: metadata — video
 
-        if let duration = try? await asset.load(.duration) {
-            durationMs = Int64(CMTimeGetSeconds(duration) * 1000.0)
+    @available(iOS 16.0, *)
+    private static func videoFacts(from asset: AVURLAsset) async -> VideoFacts {
+        var facts = VideoFacts()
+
+        if let duration = try? await asset.load(.duration), duration.isNumeric {
+            facts.durationMs = Int64(CMTimeGetSeconds(duration) * 1000.0)
         }
 
         if let track = try? await asset.loadTracks(withMediaType: .video).first,
            let (size, transform) = try? await track.load(.naturalSize, .preferredTransform) {
-            rotation = self.rotation(from: transform)
-            (width, height) = orient(size: size, rotation: rotation)
-
-            if let descriptions = try? await track.load(.formatDescriptions),
-               let first = descriptions.first,
-               CMFormatDescriptionGetMediaType(first) == kCMMediaType_Video {
-                mimeType = "video/mp4"
-            }
+            facts.rotation = rotation(from: transform)
+            (facts.width, facts.height) = orient(size: size, rotation: facts.rotation)
         }
 
-        return [
-            "durationMs": durationMs,
-            "width": width,
-            "height": height,
-            "rotation": rotation,
-            "mimeType": mimeType,
-        ]
+        if let item = try? await asset.load(.creationDate),
+           let value = try? await item.load(.dateValue) {
+            facts.creationDate = value
+        }
+
+        var items = (try? await asset.load(.commonMetadata)) ?? []
+        items += (try? await asset.loadMetadata(for: .quickTimeMetadata)) ?? []
+        items += (try? await asset.loadMetadata(for: .quickTimeUserData)) ?? []
+
+        for item in items {
+            guard let key = metadataKey(of: item) else { continue }
+            guard let text = try? await item.load(.stringValue), !text.isEmpty else { continue }
+            apply(key: key, text: text, to: &facts)
+        }
+
+        return facts
     }
 
-    private static func loadMetadataLegacy(from asset: AVURLAsset) -> [String: Any] {
-        var width = 0
-        var height = 0
-        var rotation = 0
-        var mimeType: Any = NSNull()
+    private static func videoFactsLegacy(from asset: AVURLAsset) -> VideoFacts {
+        var facts = VideoFacts()
 
-        let durationMs = Int64(CMTimeGetSeconds(asset.duration) * 1000.0)
+        let duration = asset.duration
+        if duration.isNumeric {
+            facts.durationMs = Int64(CMTimeGetSeconds(duration) * 1000.0)
+        }
 
         if let track = asset.tracks(withMediaType: .video).first {
-            rotation = self.rotation(from: track.preferredTransform)
-            (width, height) = orient(size: track.naturalSize, rotation: rotation)
-
-            // The legacy accessor is typed [Any], but only ever holds CMFormatDescription.
-            if let first = track.formatDescriptions.first,
-               CMFormatDescriptionGetMediaType(first as! CMFormatDescription) == kCMMediaType_Video {
-                mimeType = "video/mp4"
-            }
+            facts.rotation = rotation(from: track.preferredTransform)
+            (facts.width, facts.height) = orient(size: track.naturalSize, rotation: facts.rotation)
         }
 
+        facts.creationDate = asset.creationDate?.dateValue
+
+        var items = asset.commonMetadata
+        items += asset.metadata
+
+        for item in items {
+            guard let key = metadataKey(of: item),
+                  let text = item.stringValue, !text.isEmpty else { continue }
+            apply(key: key, text: text, to: &facts)
+        }
+
+        return facts
+    }
+
+    /// The metadata key as a plain string, whichever namespace it came from.
+    private static func metadataKey(of item: AVMetadataItem) -> String? {
+        if let common = item.commonKey?.rawValue { return common }
+        if let key = item.key as? String { return key }
+        return item.identifier?.rawValue
+    }
+
+    /// Folds one metadata item into `facts`. Unknown keys are ignored, so a file
+    /// carrying only some of these still yields the rest.
+    private static func apply(key: String, text: String, to facts: inout VideoFacts) {
+        let normalised = key.lowercased()
+        if normalised.hasSuffix("make"), facts.make == nil {
+            facts.make = text
+        } else if normalised.hasSuffix("model"), facts.model == nil {
+            facts.model = text
+        } else if normalised.contains("location"), facts.isoLocation == nil {
+            facts.isoLocation = text
+        }
+    }
+
+    private static func payload(from facts: VideoFacts, url: URL) -> [String: Any] {
+        let coordinates = parseISO6709(facts.isoLocation)
         return [
-            "durationMs": durationMs,
-            "width": width,
-            "height": height,
-            "rotation": rotation,
-            "mimeType": mimeType,
+            "durationMs": facts.durationMs as Any? ?? NSNull(),
+            "width": facts.width,
+            "height": facts.height,
+            "rotation": facts.rotation,
+            "mimeType": mimeType(for: url) as Any? ?? NSNull(),
+            "capturedAt": epochMs(facts.creationDate) as Any? ?? NSNull(),
+            "modifiedAt": fileModifiedAtMs(url) as Any? ?? NSNull(),
+            "cameraMake": facts.make as Any? ?? NSNull(),
+            "cameraModel": facts.model as Any? ?? NSNull(),
+            "gps": coordinates ?? NSNull(),
         ]
     }
+
+    // MARK: metadata — images
+
+    /// Reads still-image metadata via ImageIO. Returns nil when `url` is not a
+    /// local image, in which case the caller falls back to the AVFoundation path.
+    ///
+    /// Restricted to file URLs on purpose: `CGImageSourceCreateWithURL` would
+    /// otherwise fetch a remote URL synchronously.
+    private static func imageMetadata(at url: URL) -> [String: Any]? {
+        guard url.isFileURL,
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) > 0,
+              let uti = CGImageSourceGetType(source) as String?
+        else {
+            return nil
+        }
+
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any] ?? [:]
+        let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
+        let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] ?? [:]
+        let gps = properties[kCGImagePropertyGPSDictionary] as? [CFString: Any] ?? [:]
+
+        let storedWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+        let storedHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let rotationDegrees = rotationForExifOrientation(orientation)
+        // Orientations 5–8 are quarter turns, so the stored pixels are transposed
+        // relative to how the image displays.
+        let quarterTurn = orientation >= 5
+        let width = quarterTurn ? storedHeight : storedWidth
+        let height = quarterTurn ? storedWidth : storedHeight
+
+        let capturedRaw = (exif[kCGImagePropertyExifDateTimeOriginal] as? String)
+            ?? (exif[kCGImagePropertyExifDateTimeDigitized] as? String)
+            ?? (tiff[kCGImagePropertyTIFFDateTime] as? String)
+        let offsetRaw = (exif[kCGImagePropertyExifOffsetTimeOriginal] as? String)
+            ?? (exif[kCGImagePropertyExifOffsetTime] as? String)
+
+        return [
+            // Images have no duration; null is what distinguishes them from a
+            // zero-length video.
+            "durationMs": NSNull(),
+            "width": width,
+            "height": height,
+            "rotation": rotationDegrees,
+            "mimeType": mimeType(forIdentifier: uti) as Any? ?? NSNull(),
+            "capturedAt": epochMs(exifDate(capturedRaw, utcOffset: offsetRaw)) as Any? ?? NSNull(),
+            "modifiedAt": fileModifiedAtMs(url) as Any? ?? NSNull(),
+            "cameraMake": (tiff[kCGImagePropertyTIFFMake] as? String) as Any? ?? NSNull(),
+            "cameraModel": (tiff[kCGImagePropertyTIFFModel] as? String) as Any? ?? NSNull(),
+            "gps": gpsPayload(from: gps) ?? NSNull(),
+        ]
+    }
+
+    /// Clockwise display rotation implied by an EXIF orientation tag (1–8).
+    private static func rotationForExifOrientation(_ orientation: Int) -> Int {
+        switch orientation {
+        case 3, 4: return 180
+        case 5, 6: return 90
+        case 7, 8: return 270
+        default: return 0
+        }
+    }
+
+    private static func gpsPayload(from gps: [CFString: Any]) -> [String: Any]? {
+        guard let latitude = (gps[kCGImagePropertyGPSLatitude] as? NSNumber)?.doubleValue,
+              let longitude = (gps[kCGImagePropertyGPSLongitude] as? NSNumber)?.doubleValue
+        else {
+            // No usable fix: report the whole group as absent rather than 0, 0.
+            return nil
+        }
+
+        let latitudeRef = (gps[kCGImagePropertyGPSLatitudeRef] as? String)?.uppercased() ?? "N"
+        let longitudeRef = (gps[kCGImagePropertyGPSLongitudeRef] as? String)?.uppercased() ?? "E"
+
+        var payload: [String: Any] = [
+            "lat": latitudeRef == "S" ? -latitude : latitude,
+            "lon": longitudeRef == "W" ? -longitude : longitude,
+        ]
+
+        if let altitude = (gps[kCGImagePropertyGPSAltitude] as? NSNumber)?.doubleValue {
+            // AltitudeRef 1 means below sea level.
+            let belowSeaLevel = (gps[kCGImagePropertyGPSAltitudeRef] as? NSNumber)?.intValue == 1
+            payload["alt"] = belowSeaLevel ? -altitude : altitude
+        }
+        return payload
+    }
+
+    // MARK: metadata — shared helpers
+
+    /// Parses an ISO-6709 location string such as `+37.7749-122.4194+010.500/`.
+    private static func parseISO6709(_ raw: String?) -> [String: Any]? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let pattern = #"([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw))
+        else {
+            return nil
+        }
+
+        func group(_ index: Int) -> Double? {
+            guard let range = Range(match.range(at: index), in: raw) else { return nil }
+            return Double(raw[range])
+        }
+
+        guard let latitude = group(1), let longitude = group(2) else { return nil }
+        var payload: [String: Any] = ["lat": latitude, "lon": longitude]
+        if let altitude = group(3) { payload["alt"] = altitude }
+        return payload
+    }
+
+    /// Parses an EXIF timestamp (`yyyy:MM:dd HH:mm:ss`). Without an explicit UTC
+    /// offset EXIF carries no time zone, so the device's zone is assumed.
+    private static func exifDate(_ raw: String?, utcOffset: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        if let utcOffset, !utcOffset.isEmpty {
+            formatter.dateFormat = "yyyy:MM:dd HH:mm:ssXXXXX"
+            if let date = formatter.date(from: raw + utcOffset) { return date }
+        }
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        formatter.timeZone = .current
+        return formatter.date(from: raw)
+    }
+
+    private static func epochMs(_ date: Date?) -> Int64? {
+        guard let date else { return nil }
+        return Int64(date.timeIntervalSince1970 * 1000.0)
+    }
+
+    private static func fileModifiedAtMs(_ url: URL) -> Int64? {
+        guard url.isFileURL,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let modified = attributes[.modificationDate] as? Date
+        else {
+            return nil
+        }
+        return epochMs(modified)
+    }
+
+    private static func mimeType(for url: URL) -> String? {
+        let ext = url.pathExtension
+        guard !ext.isEmpty else { return nil }
+        if #available(iOS 14.0, *) {
+            return UTType(filenameExtension: ext)?.preferredMIMEType
+        }
+        return legacyMimeTypes[ext.lowercased()]
+    }
+
+    private static func mimeType(forIdentifier identifier: String) -> String? {
+        if #available(iOS 14.0, *) {
+            return UTType(identifier)?.preferredMIMEType
+        }
+        return legacyMimeTypes[identifier.components(separatedBy: ".").last?.lowercased() ?? ""]
+    }
+
+    /// Minimal fallback for iOS 13, which predates `UTType`.
+    private static let legacyMimeTypes: [String: String] = [
+        "mp4": "video/mp4", "m4v": "video/x-m4v", "mov": "video/quicktime",
+        "3gp": "video/3gpp", "avi": "video/x-msvideo", "mkv": "video/x-matroska",
+        "webm": "video/webm", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "gif": "image/gif", "heic": "image/heic",
+        "heif": "image/heif", "webp": "image/webp", "tiff": "image/tiff",
+    ]
+
 
     /// Degrees clockwise, derived from the track's preferred transform.
     private static func rotation(from transform: CGAffineTransform) -> Int {

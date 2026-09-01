@@ -631,6 +631,36 @@ class _DemoHomeState extends State<DemoHome> {
     });
   }
 
+  /// Reads metadata for the current source and shows every field, including the
+  /// ones that came back null — that is the point of the panel.
+  Future<void> _showMetadata() async {
+    _editNode.unfocus();
+    final source = _video.text.trim();
+    if (source.isEmpty) return;
+
+    VideoMetadata? meta;
+    String? error;
+    try {
+      meta = await VideoThumbnail.getVideoMetadata(video: source);
+    } on ThumbnailException catch (e) {
+      error = '${e.code.name}: ${e.message}';
+    } catch (e) {
+      error = e.toString();
+    }
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _surface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _MetadataSheet(meta: meta, error: error),
+    );
+  }
+
   void _saveFileRequest() {
     _editNode.unfocus();
     setState(() {
@@ -980,6 +1010,13 @@ class _DemoHomeState extends State<DemoHome> {
               ),
             ],
           ),
+          // Metadata inspector
+          IconButton(
+            icon: const Icon(Icons.info_outline_rounded,
+                color: _muted, size: 19),
+            tooltip: 'Metadata',
+            onPressed: _showMetadata,
+          ),
           // Settings (opens endDrawer)
           Builder(
             builder: (ctx) => IconButton(
@@ -1033,6 +1070,114 @@ class _DemoHomeState extends State<DemoHome> {
           ),
         ),
       );
+}
+
+// ─── Metadata sheet ───────────────────────────────────────────────────────────
+
+/// Renders every [VideoMetadata] field. Absent values are shown as a dimmed
+/// "null" rather than hidden, so it is obvious which tags a file actually
+/// carries on each platform.
+class _MetadataSheet extends StatelessWidget {
+  final VideoMetadata? meta;
+  final String? error;
+
+  const _MetadataSheet({required this.meta, required this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    final m = meta;
+    final rows = <(String, String?)>[
+      ('mimeType', m?.mimeType),
+      ('width', m == null ? null : '${m.width} px'),
+      ('height', m == null ? null : '${m.height} px'),
+      ('rotation', m == null ? null : '${m.rotation}°'),
+      ('duration', m?.duration?.toString()),
+      ('durationMs', m == null ? null : '${m.durationMs}'),
+      ('capturedAt', m?.capturedAt?.toString()),
+      ('modifiedAt', m?.modifiedAt?.toString()),
+      ('cameraMake', m?.cameraMake),
+      ('cameraModel', m?.cameraModel),
+      ('gps.lat', m?.gps?.lat.toString()),
+      ('gps.lon', m?.gps?.lon.toString()),
+      ('gps.alt', m?.gps?.alt?.toString()),
+    ];
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Metadata',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                fontSize: 16,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              error ??
+                  (m == null
+                      ? 'No metadata returned for this source.'
+                      : 'Any field may be null depending on the source file '
+                          'and platform.'),
+              style: TextStyle(
+                color: error != null ? Colors.redAccent : _muted,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (m != null)
+              Flexible(
+                child: SingleChildScrollView(
+                  child: Column(
+                    children: [
+                      for (final (label, value) in rows)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              SizedBox(
+                                width: 108,
+                                child: Text(
+                                  label,
+                                  style: const TextStyle(
+                                    color: _muted,
+                                    fontSize: 12.5,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  value ?? 'null',
+                                  style: TextStyle(
+                                    color: value == null
+                                        ? _muted.withValues(alpha: 0.5)
+                                        : Colors.white,
+                                    fontSize: 12.5,
+                                    fontStyle: value == null
+                                        ? FontStyle.italic
+                                        : FontStyle.normal,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 // ─── Helper widgets ───────────────────────────────────────────────────────────

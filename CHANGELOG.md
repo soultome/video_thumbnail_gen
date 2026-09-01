@@ -4,6 +4,48 @@ Build-system modernisation and a full Swift rewrite of the iOS implementation.
 No public Dart API, method-channel name, or method signature changed — existing
 code keeps working. Toolchain minimums went up.
 
+### 📇 Richer media metadata
+
+`getVideoMetadata` now describes **images as well as videos**, and returns considerably more.
+The method name, signature, and every previously returned field are unchanged.
+
+New fields on `VideoMetadata`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `duration` | `Duration?` | `null` for images; `durationMs` stays non-nullable and reports `0` |
+| `capturedAt` | `DateTime?` | When the media was shot — not the file's mtime |
+| `modifiedAt` | `DateTime?` | Last file modification time |
+| `cameraMake` | `String?` | e.g. `"Apple"` |
+| `cameraModel` | `String?` | e.g. `"iPhone 15 Pro"` |
+| `gps` | `GpsCoordinates?` | New type: `lat`, `lon`, and independently nullable `alt` |
+
+- Every field resolves independently: a file with GPS but no camera model returns the location
+  and a `null` `cameraModel`. A missing tag never fails the call.
+- `gps` is `null` **as a group** when the file records no location — it is never defaulted
+  to `0, 0`. `alt` is `null` on its own when a fix has no altitude.
+- `mimeType` is now derived from the actual container/UTI rather than hard-coded. On iOS a
+  `.mov` correctly reports `video/quicktime` where it previously reported `video/mp4`; images
+  report `image/heic`, `image/jpeg`, and so on.
+- Images are read through ImageIO (iOS) and `androidx.exifinterface` (Android), which is a new
+  Android dependency. Android `content://` URIs are supported for every field, including
+  `modifiedAt`.
+- `width`/`height` remain display dimensions, now also honouring EXIF orientation for images.
+- `capturedAt` is best-effort: EXIF stores local time with no UTC offset, so absent an explicit
+  offset tag the device's time zone is assumed.
+
+Platform limits worth knowing: `MediaMetadataRetriever` exposes no camera make/model keys, so
+those are always `null` for **videos on Android**. On iOS, image metadata is read from local
+files only; remote URLs go through AVFoundation.
+
+**Fixed (Android, pre-existing):** any failure inside a known method was reported as
+`notImplemented()`, which reached Dart as `MissingPluginException` instead of the plugin's own
+error codes. `FILE_NOT_FOUND`, `IO_ERROR`, and friends never actually surfaced on Android. The
+exception is now checked before the not-handled case, so typed errors reach Dart as intended.
+
+**Changed:** `getVideoMetadata` on a nonexistent file path now raises `FILE_NOT_FOUND` on both
+platforms. iOS previously returned a metadata map full of zeros.
+
 ### 🍎 iOS — rewritten in Swift
 
 - The iOS implementation is now **Swift** (`VideoThumbnailPlugin.swift`), replacing the
