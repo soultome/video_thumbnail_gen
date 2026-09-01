@@ -8,3 +8,9 @@ build/
 
 .idea/
 *.iml
+
+.vscode/
+
+# Swift Package Manager
+.build/
+.swiftpm/
