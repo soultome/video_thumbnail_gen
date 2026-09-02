@@ -441,6 +441,16 @@ void main() {
       await file.delete();
     });
 
+    test('the HTTP client is closed after fetching', () async {
+      MockHttpOverrides.created.clear();
+      await VideoThumbnail.thumbnailData(
+        video: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      );
+      // A client left open would keep its connection pool and sockets alive.
+      expect(MockHttpOverrides.created, isNotEmpty);
+      expect(MockHttpOverrides.created.every((c) => c.closed), isTrue);
+    });
+
     test('thumbnailData with custom scaling executes successfully', () async {
       final bytes = await VideoThumbnail.thumbnailData(
         video: 'https://youtu.be/Gzz8FwSlsUg?si=4Sfkps4ev2DUXVRR',
@@ -455,16 +465,29 @@ void main() {
 // ─── Mock Network overrides ──────────────────────────────────────────────────
 
 class MockHttpOverrides extends HttpOverrides {
+  /// Every client handed out, so tests can verify they are all closed.
+  static final List<MockHttpClient> created = <MockHttpClient>[];
+
   @override
   HttpClient createHttpClient(SecurityContext? context) {
-    return MockHttpClient();
+    final client = MockHttpClient();
+    created.add(client);
+    return client;
   }
 }
 
 class MockHttpClient implements HttpClient {
+  /// Set once the client is closed, so tests can assert it is not leaked.
+  bool closed = false;
+
   @override
   Future<HttpClientRequest> getUrl(Uri url) async {
     return MockHttpClientRequest();
+  }
+
+  @override
+  void close({bool force = false}) {
+    closed = true;
   }
 
   @override

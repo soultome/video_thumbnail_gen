@@ -78,6 +78,7 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
         executor = null
         memoryCache?.evictAll()
         memoryCache = null
+        context = null
     }
 
     // ─── Method dispatch ──────────────────────────────────────────────────────
@@ -91,16 +92,24 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             return
         }
 
-        val args = call.arguments<Map<String, Any?>>()!!
-        val video = args["video"] as String
+        val args = call.arguments<Map<String, Any?>>()
+        val video = args?.get("video") as? String
+        if (video.isNullOrEmpty()) {
+            runOnUiThread {
+                result.error(ERR_UNSUPPORTED, "Missing or malformed 'video' argument", null)
+            }
+            return
+        }
 
         @Suppress("UNCHECKED_CAST")
         val headers = args["headers"] as? HashMap<String, String>
-        val format = args["format"] as Int
-        val maxh = args["maxh"] as Int
-        val maxw = args["maxw"] as Int
-        val timeMs = args["timeMs"] as Int
-        val quality = args["quality"] as Int
+        // Read defensively: `metadata` sends only what it needs, and a missing
+        // key must not take down the call.
+        val format = args["format"] as? Int ?: 0
+        val maxh = args["maxh"] as? Int ?: 0
+        val maxw = args["maxw"] as? Int ?: 0
+        val timeMs = args["timeMs"] as? Int ?: 0
+        val quality = args["quality"] as? Int ?: 0
 
         executor?.execute {
             var thumbnail: Any? = null
@@ -179,7 +188,7 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
         }
         val bitmap = createVideoThumbnail(vidPath, headers, maxh, maxw, timeMs)
             ?: throw NullPointerException("Could not decode frame")
-        val stream = ByteArrayOutputStream()
+        val stream = ByteArrayOutputStream(DEFAULT_ENCODE_BUFFER)
         bitmap.compress(intToFormat(format), quality, stream)
         bitmap.recycle()
         val bytes = stream.toByteArray()
@@ -242,8 +251,8 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
         maxw: Int,
         quality: Int,
     ): List<ByteArray?> {
-        val results = mutableListOf<ByteArray?>()
-        if (timesMs.isNullOrEmpty()) return results
+        if (timesMs.isNullOrEmpty()) return emptyList()
+        val results = ArrayList<ByteArray?>(timesMs.size)
         val cf = intToFormat(format)
         val retriever = MediaMetadataRetriever()
         try {
@@ -251,39 +260,20 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             for (ms in timesMs) {
                 var frame: Bitmap? = null
                 try {
-                    frame = if (maxh != 0 || maxw != 0) {
-                        if (Build.VERSION.SDK_INT >= 27 && maxh != 0 && maxw != 0) {
-                            retriever.getScaledFrameAtTime(
-                                ms.toLong() * 1000,
-                                MediaMetadataRetriever.OPTION_CLOSEST,
-                                maxw,
-                                maxh,
-                            )
-                        } else {
-                            retriever.getFrameAtTime(
-                                ms.toLong() * 1000,
-                                MediaMetadataRetriever.OPTION_CLOSEST,
-                            )?.let { scaleAndRecycle(it, maxh, maxw) }
-                        }
-                    } else {
-                        retriever.getFrameAtTime(ms.toLong() * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
-                    }
-                    if (frame != null) {
-                        val s = ByteArrayOutputStream()
-                        frame.compress(cf, quality, s)
-                        results.add(s.toByteArray())
-                    } else {
+                    frame = extractFrame(retriever, ms, maxh, maxw)
+                    if (frame == null) {
                         results.add(null)
+                    } else {
+                        val stream = ByteArrayOutputStream(DEFAULT_ENCODE_BUFFER)
+                        frame.compress(cf, quality, stream)
+                        results.add(stream.toByteArray())
                     }
                 } finally {
                     frame?.recycle()
                 }
             }
         } finally {
-            try {
-                retriever.release()
-            } catch (ignored: Exception) {
-            }
+            retriever.releaseQuietly()
         }
         return results
     }
@@ -522,41 +512,19 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
         targetW: Int,
         timeMs: Int,
     ): Bitmap? {
-        var bitmap: Bitmap? = null
         val retriever = MediaMetadataRetriever()
-        try {
+        return try {
             openRetriever(video, headers, retriever)
-            bitmap = if (targetH != 0 || targetW != 0) {
-                if (Build.VERSION.SDK_INT >= 27 && targetH != 0 && targetW != 0) {
-                    retriever.getScaledFrameAtTime(
-                        timeMs.toLong() * 1000,
-                        MediaMetadataRetriever.OPTION_CLOSEST,
-                        targetW,
-                        targetH,
-                    )
-                } else {
-                    retriever.getFrameAtTime(
-                        timeMs.toLong() * 1000,
-                        MediaMetadataRetriever.OPTION_CLOSEST,
-                    )?.let { scaleAndRecycle(it, targetH, targetW) }
-                }
-            } else {
-                retriever.getFrameAtTime(timeMs.toLong() * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
-            }
+            extractFrame(retriever, timeMs, targetH, targetW)
         } catch (ex: RuntimeException) {
             ex.printStackTrace()
+            null
         } catch (ex: IOException) {
             ex.printStackTrace()
+            null
         } finally {
-            try {
-                retriever.release()
-            } catch (ex: RuntimeException) {
-                ex.printStackTrace()
-            } catch (ex: IOException) {
-                ex.printStackTrace()
-            }
+            retriever.releaseQuietly()
         }
-        return bitmap
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
@@ -613,12 +581,56 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             else -> Bitmap.CompressFormat.JPEG
         }
 
+        /**
+         * Extension for the bytes that are actually produced, which is not always
+         * the requested format: [intToFormat] encodes HEIC as JPEG because
+         * `Bitmap.compress` has no HEIC encoder. Naming that file `.heic` would
+         * hand callers a JPEG wearing the wrong extension.
+         */
         private fun formatExt(format: Int): String = when (format) {
             FORMAT_PNG -> "png"
             FORMAT_WEBP -> "webp"
-            FORMAT_HEIC -> "heic"
-            FORMAT_JPEG -> "jpg"
             else -> "jpg"
+        }
+
+        /** Starting size for encode buffers, so small frames never resize the array. */
+        private const val DEFAULT_ENCODE_BUFFER = 64 * 1024
+
+        /**
+         * Decodes one frame, scaling during decode when the platform allows it.
+         *
+         * Shared by the single-frame and batch paths, which previously carried
+         * byte-identical copies of this branching.
+         */
+        private fun extractFrame(
+            retriever: MediaMetadataRetriever,
+            timeMs: Int,
+            targetH: Int,
+            targetW: Int,
+        ): Bitmap? {
+            val timeUs = timeMs.toLong() * 1000
+            if (targetH == 0 && targetW == 0) {
+                return retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+            }
+            // Scaling inside the decoder avoids ever materialising the full-size frame.
+            if (Build.VERSION.SDK_INT >= 27 && targetH != 0 && targetW != 0) {
+                return retriever.getScaledFrameAtTime(
+                    timeUs,
+                    MediaMetadataRetriever.OPTION_CLOSEST,
+                    targetW,
+                    targetH,
+                )
+            }
+            return retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?.let { scaleAndRecycle(it, targetH, targetW) }
+        }
+
+        /** Releases without letting a teardown failure mask the real error. */
+        private fun MediaMetadataRetriever.releaseQuietly() {
+            try {
+                release()
+            } catch (ignored: Exception) {
+            }
         }
 
         private fun scaleAndRecycle(original: Bitmap, targetH: Int, targetW: Int): Bitmap {
@@ -640,8 +652,11 @@ class VideoThumbnailPlugin : FlutterPlugin, MethodCallHandler {
             FileInputStream(videoFile.absolutePath).use { retriever.setDataSource(it.fd) }
         }
 
+        /** Reused across every reply; allocating one per result is pure waste. */
+        private val mainHandler = Handler(Looper.getMainLooper())
+
         private fun runOnUiThread(runnable: Runnable) {
-            Handler(Looper.getMainLooper()).post(runnable)
+            mainHandler.post(runnable)
         }
     }
 }

@@ -1,7 +1,3 @@
-# Root screenshots / dev images
-video_file.png
-video_url.png
-
 # Build artifacts
 build/
 .dart_tool/

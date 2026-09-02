@@ -465,16 +465,7 @@ class VideoThumbnail {
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'metadata',
-        <String, dynamic>{
-          'video': video,
-          'headers': headers,
-          // Dummy fields to keep native argument parsing happy
-          'format': 0,
-          'maxh': 0,
-          'maxw': 0,
-          'timeMs': 0,
-          'quality': 0,
-        },
+        <String, dynamic>{'video': video, 'headers': headers},
       );
       if (result == null) return null;
       return VideoMetadata.fromMap(result);
@@ -497,12 +488,14 @@ class VideoThumbnail {
 
   // ── Private helpers for YouTube URLs ──────────────────────────────────────────
 
+  /// Compiled once — [_extractYoutubeId] runs on every public call.
+  static final RegExp _youtubeIdPattern = RegExp(
+    r'^.*(?:(?:youtu\.be\/|v\/|vi\/|u\/\w\/|embed\/|shorts\/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*',
+    caseSensitive: false,
+  );
+
   static String? _extractYoutubeId(String url) {
-    final regExp = RegExp(
-      r'^.*(?:(?:youtu\.be\/|v\/|vi\/|u\/\w\/|embed\/|shorts\/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*',
-      caseSensitive: false,
-    );
-    final match = regExp.firstMatch(url);
+    final match = _youtubeIdPattern.firstMatch(url);
     if (match != null && match.groupCount >= 1) {
       final id = match.group(1);
       if (id != null && id.length == 11) {
@@ -521,35 +514,55 @@ class VideoThumbnail {
     ];
 
     final client = HttpClient();
-    for (final url in urls) {
-      try {
-        final request = await client.getUrl(Uri.parse(url));
-        if (headers != null) {
-          headers.forEach((key, val) => request.headers.add(key, val));
-        }
-        final response = await request.close();
-        if (response.statusCode == 200) {
-          if (response.contentLength > 1500 || url == urls.last) {
-            final builder = BytesBuilder();
+    try {
+      for (final url in urls) {
+        try {
+          final request = await client.getUrl(Uri.parse(url));
+          if (headers != null) {
+            headers.forEach((key, val) => request.headers.add(key, val));
+          }
+          final response = await request.close();
+          if (response.statusCode == 200 &&
+              (response.contentLength > 1500 || url == urls.last)) {
+            final builder = BytesBuilder(copy: false);
             await for (final chunk in response) {
               builder.add(chunk);
             }
             final bytes = builder.takeBytes();
             if (bytes.isNotEmpty) return bytes;
           }
-        }
-      } catch (_) {}
+          // Drain so the connection can be returned to the pool.
+          await response.drain<void>();
+        } catch (_) {}
+      }
+      return null;
+    } finally {
+      // Without this the client keeps its connection pool (and sockets) alive.
+      client.close();
     }
-    return null;
   }
 
   static Future<Uint8List> _scaleImage(
       Uint8List bytes, int maxWidth, int maxHeight) async {
+    ui.Codec? scaleCodec;
+    ui.Image? scaledImage;
     try {
-      final codec = await ui.instantiateImageCodec(bytes);
-      final frame = await codec.getNextFrame();
-      final originalW = frame.image.width;
-      final originalH = frame.image.height;
+      // Read the header only. Fully decoding just to learn the dimensions
+      // allocated a second full-size bitmap for nothing.
+      final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+      final ui.ImageDescriptor descriptor;
+      try {
+        descriptor = await ui.ImageDescriptor.encoded(buffer);
+      } catch (_) {
+        buffer.dispose();
+        return bytes;
+      }
+      final originalW = descriptor.width;
+      final originalH = descriptor.height;
+      descriptor.dispose();
+      buffer.dispose();
+
+      if (originalW <= 0 || originalH <= 0) return bytes;
 
       int targetW = maxWidth;
       int targetH = maxHeight;
@@ -568,18 +581,25 @@ class VideoThumbnail {
         return bytes;
       }
 
-      final scaleCodec = await ui.instantiateImageCodec(
+      scaleCodec = await ui.instantiateImageCodec(
         bytes,
         targetWidth: targetW,
         targetHeight: targetH,
       );
       final scaledFrame = await scaleCodec.getNextFrame();
+      scaledImage = scaledFrame.image;
       final byteData =
-          await scaledFrame.image.toByteData(format: ui.ImageByteFormat.png);
+          await scaledImage.toByteData(format: ui.ImageByteFormat.png);
       if (byteData != null) {
         return byteData.buffer.asUint8List();
       }
-    } catch (_) {}
+    } catch (_) {
+      // Fall through to the original bytes.
+    } finally {
+      // ui.Image and ui.Codec hold native memory the GC will not reclaim promptly.
+      scaledImage?.dispose();
+      scaleCodec?.dispose();
+    }
     return bytes;
   }
 }
