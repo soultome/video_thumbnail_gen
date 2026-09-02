@@ -4,6 +4,48 @@ Build-system modernisation and a full Swift rewrite of the iOS implementation.
 No public Dart API, method-channel name, or method signature changed — existing
 code keeps working. Toolchain minimums went up.
 
+### ⚡ Internal optimisation pass
+
+No public API or method signature changed.
+
+**Leaks fixed**
+- The `HttpClient` used for YouTube thumbnails was never closed, leaking its connection pool
+  and sockets on every fetch. Now closed in a `finally`, with responses drained so connections
+  return to the pool. Covered by a regression test.
+- `_scaleImage` never disposed the `ui.Image`/`ui.Codec` it created — native memory the GC does
+  not reclaim promptly. Both are now disposed in a `finally`.
+- The example's thumbnail loader added an `ImageStreamListener` and never removed it, retaining
+  the completer and decoded image for the stream's lifetime.
+
+**Wasted work removed**
+- `_scaleImage` decoded the image **twice**: once at full size purely to read its dimensions,
+  then again at the target size. It now reads dimensions from the header via
+  `ImageDescriptor.encoded` and decodes only once, at the target size.
+- `getVideoMetadata` padded every call with five dummy thumbnail arguments (`format`, `maxh`,
+  `maxw`, `timeMs`, `quality`) that existed only to satisfy unsafe native casts. The native
+  argument reads are now defensive, and the payload carries just `video` and `headers`.
+- The YouTube-ID `RegExp` was recompiled on every public call; it is now compiled once.
+- Android allocated a fresh `Handler` for every method-channel reply; one is now reused.
+- iOS awaited the value of *every* AVFoundation metadata item before deciding whether it was
+  relevant. It now filters by key first and stops once make, model, and location are found.
+- Android `ByteArrayOutputStream`s for frame encoding start at 64 KB instead of growing from 32
+  bytes, and the batch result list is pre-sized.
+
+**Correctness**
+- **Android: `thumbnailFile` with `ImageFormat.HEIC` wrote JPEG bytes into a `.heic` file.**
+  `Bitmap.compress` has no HEIC encoder, so HEIC has always been encoded as JPEG, but the
+  filename still claimed HEIC. It now correctly gets a `.jpg` extension — the same fix already
+  applied to WebP on iOS.
+- iOS only treats a file as an image when its UTI actually conforms to `public.image`, so a
+  container ImageIO happens to recognise can never be misread as a still.
+- Android clears its retained `Context` on detach, and a missing/malformed `video` argument
+  returns `UNSUPPORTED_FORMAT` instead of throwing a cast exception.
+
+**Duplication removed**
+- The single-frame and batch paths on Android carried byte-identical frame-extraction branching;
+  both now call one `extractFrame` helper, alongside a shared `releaseQuietly`.
+- Removed two stale `.pubignore` entries for files that no longer exist.
+
 ### 📇 Richer media metadata
 
 `getVideoMetadata` now describes **images as well as videos**, and returns considerably more.

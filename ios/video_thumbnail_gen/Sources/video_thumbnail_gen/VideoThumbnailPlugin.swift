@@ -394,7 +394,8 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
         items += (try? await asset.loadMetadata(for: .quickTimeUserData)) ?? []
 
         for item in items {
-            guard let key = metadataKey(of: item) else { continue }
+            if facts.make != nil, facts.model != nil, facts.isoLocation != nil { break }
+            guard let key = metadataKey(of: item), wants(key: key, given: facts) else { continue }
             guard let text = try? await item.load(.stringValue), !text.isEmpty else { continue }
             apply(key: key, text: text, to: &facts)
         }
@@ -421,7 +422,8 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
         items += asset.metadata
 
         for item in items {
-            guard let key = metadataKey(of: item),
+            if facts.make != nil, facts.model != nil, facts.isoLocation != nil { break }
+            guard let key = metadataKey(of: item), wants(key: key, given: facts),
                   let text = item.stringValue, !text.isEmpty else { continue }
             apply(key: key, text: text, to: &facts)
         }
@@ -434,6 +436,16 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
         if let common = item.commonKey?.rawValue { return common }
         if let key = item.key as? String { return key }
         return item.identifier?.rawValue
+    }
+
+    /// Whether this key is one we still need — checked before paying for the
+    /// item's value, which is an `await` on the modern path.
+    private static func wants(key: String, given facts: VideoFacts) -> Bool {
+        let normalised = key.lowercased()
+        if normalised.hasSuffix("make") { return facts.make == nil }
+        if normalised.hasSuffix("model") { return facts.model == nil }
+        if normalised.contains("location") { return facts.isoLocation == nil }
+        return false
     }
 
     /// Folds one metadata item into `facts`. Unknown keys are ignored, so a file
@@ -476,7 +488,8 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
         guard url.isFileURL,
               let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               CGImageSourceGetCount(source) > 0,
-              let uti = CGImageSourceGetType(source) as String?
+              let uti = CGImageSourceGetType(source) as String?,
+              isImageType(uti)
         else {
             return nil
         }
@@ -517,6 +530,14 @@ public final class VideoThumbnailPlugin: NSObject, FlutterPlugin {
             "cameraModel": (tiff[kCGImagePropertyTIFFModel] as? String) as Any? ?? NSNull(),
             "gps": gpsPayload(from: gps) ?? NSNull(),
         ]
+    }
+
+    /// True only for identifiers that actually denote a still image.
+    private static func isImageType(_ identifier: String) -> Bool {
+        if #available(iOS 14.0, *) {
+            return UTType(identifier)?.conforms(to: .image) ?? false
+        }
+        return (mimeType(forIdentifier: identifier) ?? "").hasPrefix("image/")
     }
 
     /// Clockwise display rotation implied by an EXIF orientation tag (1–8).

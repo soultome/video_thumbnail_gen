@@ -284,7 +284,8 @@ Future<ThumbnailResult> genThumbnail(ThumbnailRequest r) async {
       return completer.future;
     }
     savedPath = path;
-    bytes = File(path).readAsBytesSync();
+    // Async: readAsBytesSync would block the UI isolate on file I/O.
+    bytes = await File(path).readAsBytes();
   } else {
     // ── Load in-memory ────────────────────────────────────────────────────────
     bytes = await VideoThumbnail.thumbnailData(
@@ -304,22 +305,30 @@ Future<ThumbnailResult> genThumbnail(ThumbnailRequest r) async {
 
   final size = bytes.length;
   final img = Image.memory(bytes);
-  img.image.resolve(const ImageConfiguration()).addListener(
-        ImageStreamListener(
-          (info, _) {
-            completer.complete(ThumbnailResult(
-              image: img,
-              dataSize: size,
-              height: info.image.height,
-              width: info.image.width,
-              filePath: savedPath,
-            ));
-          },
-          onError: (exception, stackTrace) {
-            completer.completeError(exception);
-          },
-        ),
-      );
+  final stream = img.image.resolve(const ImageConfiguration());
+
+  // The listener has to be detached again: leaving it attached keeps the
+  // completer and the decoded image alive for the lifetime of the stream.
+  late final ImageStreamListener listener;
+  listener = ImageStreamListener(
+    (info, _) {
+      stream.removeListener(listener);
+      if (completer.isCompleted) return;
+      completer.complete(ThumbnailResult(
+        image: img,
+        dataSize: size,
+        height: info.image.height,
+        width: info.image.width,
+        filePath: savedPath,
+      ));
+    },
+    onError: (exception, stackTrace) {
+      stream.removeListener(listener);
+      if (completer.isCompleted) return;
+      completer.completeError(exception);
+    },
+  );
+  stream.addListener(listener);
   return completer.future;
 }
 
